@@ -1,0 +1,29 @@
+name: Collector watchdog
+
+on:
+  workflow_dispatch:
+  schedule:
+    # The primary collector is due at :17 every 3 hours. These two checks give
+    # GitHub schedule jitter time to resolve, then recover a missed/failed start.
+    - cron: "42,57 * * * *"
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      COLLECTOR_REF: main
+      COLLECTOR_DURATION_SECONDS: "13500"
+      # 3h15m: at the first watchdog check after a due slot, the previous
+      # collector is considered stale and a replacement is dispatched.
+      COLLECTOR_MAX_START_AGE_SECONDS: "11700"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check collector freshness and recover if needed
+        run: python3 -m src.watchdog
