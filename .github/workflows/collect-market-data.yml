@@ -1,0 +1,57 @@
+name: Collect Polymarket market data
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: Collection duration in seconds
+        required: false
+        default: "13500"
+  schedule:
+    # Every 3 hours at :17. Each run collects 3h45m, intentionally overlapping
+    # adjacent runs by ~45m so runner startup/schedule jitter is less likely to
+    # create gaps. Duplicate records are expected and will be de-duplicated later.
+    - cron: "17 */3 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 250
+    env:
+      SYMBOLS: BTC,ETH,SOL,XRP
+      OUTPUT_DIR: data
+      COLLECT_DURATION_SECONDS: ${{ github.event_name == 'workflow_dispatch' && inputs.duration_seconds || '13500' }}
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run focused tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Collect market data
+        run: python -m src.collector --duration-seconds "$COLLECT_DURATION_SECONDS"
+
+      - name: Show collected files
+        if: always()
+        run: du -h data/*/* 2>/dev/null || true
+
+      - name: Upload compressed JSONL data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: polymarket-data-${{ github.run_id }}-${{ github.run_attempt }}
+          path: data/**/*.jsonl.gz
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: 7
