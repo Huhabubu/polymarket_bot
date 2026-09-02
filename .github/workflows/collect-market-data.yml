@@ -49,6 +49,34 @@ jobs:
           fi
           python -m src.collector --duration-seconds "$DURATION"
 
+      - name: Validate captured sources
+        run: |
+          python - <<'PY'
+          import collections
+          import gzip
+          import json
+          from pathlib import Path
+
+          counts = collections.Counter()
+          for path in Path("data").rglob("*.jsonl.gz"):
+              with gzip.open(path, "rt", encoding="utf-8") as handle:
+                  for line in handle:
+                      counts[json.loads(line)["source"]] += 1
+
+          print("captured source counts:", dict(sorted(counts.items())))
+          required = {
+              "market_discovery",
+              "polymarket_clob",
+              "polymarket_rtds_binance",
+              "polymarket_rtds_chainlink",
+              "binance_direct",
+              "clock_probe",
+          }
+          missing = sorted(required - counts.keys())
+          if missing:
+              raise SystemExit(f"missing required data sources: {missing}")
+          PY
+
       - name: Show collected files
         if: always()
         run: du -h data/*/* 2>/dev/null || true
@@ -61,4 +89,4 @@ jobs:
           path: data/**/*.jsonl.gz
           if-no-files-found: warn
           compression-level: 0
-          retention-days: 7
+          retention-days: 1
