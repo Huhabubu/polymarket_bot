@@ -1,8 +1,12 @@
 name: Collect Polymarket market data
 
 on:
+  # Bootstrap/manual start path. Updating .collector-start intentionally launches
+  # one full collection run; ordinary code pushes do not start long collectors.
   push:
     branches: [main]
+    paths:
+      - ".collector-start"
   workflow_dispatch:
     inputs:
       duration_seconds:
@@ -10,9 +14,8 @@ on:
         required: false
         default: "13500"
   schedule:
-    # Every 3 hours at :17. Each run collects 3h45m, intentionally overlapping
-    # adjacent runs by ~45m so runner startup/schedule jitter is less likely to
-    # create gaps. Duplicate records are expected and will be de-duplicated later.
+    # Primary cadence: every 3 hours at :17 UTC. Each run lasts 3h45m,
+    # intentionally overlapping the next run by about 45 minutes.
     - cron: "17 */3 * * *"
 
 permissions:
@@ -42,29 +45,71 @@ jobs:
         run: python -m unittest discover -s tests -v
 
       - name: Collect market data
-        run: |
-          DURATION="$COLLECT_DURATION_SECONDS"
-          if [ "${{ github.event_name }}" = "push" ]; then
-            DURATION=120
-          fi
-          python -m src.collector --duration-seconds "$DURATION"
+        run: python -m src.collector --duration-seconds "$COLLECT_DURATION_SECONDS"
 
-      - name: Validate captured sources
+      - name: Validate captured sources and symbol coverage
         run: |
           python - <<'PY'
           import collections
           import gzip
           import json
+          import os
           from pathlib import Path
 
+          targets = {item.strip().upper() for item in os.environ["SYMBOLS"].split(",") if item.strip()}
           counts = collections.Counter()
-          for path in Path("data").rglob("*.jsonl.gz"):
+          token_to_symbol = {}
+          clob_asset_ids = set()
+          seen = {
+              "market_discovery": set(),
+              "polymarket_clob": set(),
+              "polymarket_rtds_binance": set(),
+              "polymarket_rtds_chainlink": set(),
+              "binance_direct": set(),
+          }
+
+          for path in sorted(Path("data").rglob("*.jsonl.gz")):
               with gzip.open(path, "rt", encoding="utf-8") as handle:
                   for line in handle:
-                      counts[json.loads(line)["source"]] += 1
+                      row = json.loads(line)
+                      source = row["source"]
+                      payload = row.get("payload") or {}
+                      counts[source] += 1
+
+                      if source == "market_discovery":
+                          for token in payload.get("tokens") or []:
+                              symbol = str(token.get("symbol", "")).upper()
+                              token_id = str(token.get("token_id", ""))
+                              if symbol in targets and token_id:
+                                  token_to_symbol[token_id] = symbol
+                                  seen[source].add(symbol)
+                      elif source == "polymarket_clob":
+                          asset_id = payload.get("asset_id")
+                          if asset_id is not None:
+                              clob_asset_ids.add(str(asset_id))
+                      elif source == "polymarket_rtds_binance":
+                          symbol = str((payload.get("payload") or {}).get("symbol", "")).upper()
+                          if symbol.endswith("USDT"):
+                              seen[source].add(symbol[:-4])
+                      elif source == "polymarket_rtds_chainlink":
+                          symbol = str((payload.get("payload") or {}).get("symbol", "")).upper()
+                          if symbol.endswith("/USD"):
+                              seen[source].add(symbol[:-4])
+                      elif source == "binance_direct":
+                          symbol = str(payload.get("symbol", "")).upper()
+                          if symbol.endswith("USDT"):
+                              seen[source].add(symbol[:-4])
+
+          seen["polymarket_clob"] = {
+              token_to_symbol[asset_id]
+              for asset_id in clob_asset_ids
+              if asset_id in token_to_symbol
+          }
 
           print("captured source counts:", dict(sorted(counts.items())))
-          required = {
+          print("captured symbol coverage:", {key: sorted(value) for key, value in seen.items()})
+
+          required_sources = {
               "market_discovery",
               "polymarket_clob",
               "polymarket_rtds_binance",
@@ -72,9 +117,17 @@ jobs:
               "binance_direct",
               "clock_probe",
           }
-          missing = sorted(required - counts.keys())
-          if missing:
-              raise SystemExit(f"missing required data sources: {missing}")
+          missing_sources = sorted(required_sources - counts.keys())
+          if missing_sources:
+              raise SystemExit(f"missing required data sources: {missing_sources}")
+
+          missing_coverage = {
+              source: sorted(targets - symbols)
+              for source, symbols in seen.items()
+              if targets - symbols
+          }
+          if missing_coverage:
+              raise SystemExit(f"missing target-symbol coverage: {missing_coverage}")
           PY
 
       - name: Show collected files
